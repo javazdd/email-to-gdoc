@@ -26,13 +26,11 @@ SCOPES = [
     'https://www.googleapis.com/auth/devstorage.full_control',
 ]
 
-GCS_PROJECT = os.environ.get('GCS_PROJECT', 'your-gcp-project-id')
-GCS_BUCKET  = os.environ.get('GCS_BUCKET',  'your-gcs-bucket-name')   # must be globally unique
+GCS_PROJECT = 'datadog-sandbox'
+GCS_BUCKET  = 'javier-feature-announcement-images'  # must be globally unique
 
-CREDENTIALS_PATH = os.environ.get('CREDENTIALS_PATH',
-                                   os.path.expanduser('~/credentials.json'))
-TOKEN_PATH       = os.environ.get('TOKEN_PATH',
-                                   os.path.expanduser('~/token.json'))
+CREDENTIALS_PATH = os.path.expanduser('~/Documents/Claude/credentials.json')
+TOKEN_PATH       = os.path.expanduser('~/Documents/Claude/token.json')
 
 
 def utf16_len(s):
@@ -499,7 +497,9 @@ def fetch_summits():
     return upcoming, on_demand
 
 
-BLOG_RSS_URL = 'https://www.datadoghq.com/blog/index.xml'
+BLOG_RSS_URL     = 'https://www.datadoghq.com/blog/index.xml'
+ENABLEMENT_URL   = 'https://www.datadoghq.com/technical-enablement/sessions/'
+ENABLEMENT_BASE  = 'https://www.datadoghq.com'
 
 
 def fetch_blog_posts(months_back=3):
@@ -566,17 +566,109 @@ def fetch_blog_posts(months_back=3):
     return grouped
 
 
+def fetch_training_sessions():
+    """
+    Fetch the Datadog Technical Enablement sessions page and return upcoming
+    English-language sessions sorted by next scheduled date.
+
+    Returns a list of (title, url, next_date_str, topics) where:
+      - title         session title
+      - url           full URL to the session page
+      - next_date_str e.g. "Apr 07, 2026"
+      - topics        list of topic strings (e.g. ["APM", "Logs"])
+    """
+    from datetime import datetime, timezone
+
+    try:
+        req = urllib.request.Request(
+            ENABLEMENT_URL,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; email_to_doc/1.0)'},
+        )
+        ctx                = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        print(f'Warning: could not fetch enablement page ({e})')
+        return []
+
+    # Session data is embedded as an inline JS variable in the HTML
+    import json as _json
+    m = re.search(r'const allSessions = (\[.*?\]);\s*\(function', raw, re.DOTALL)
+    if not m:
+        m = re.search(r'const allSessions = (\[.*?\]);', raw, re.DOTALL)
+    if not m:
+        print('Warning: could not locate allSessions data in enablement page')
+        return []
+
+    try:
+        data = _json.loads(m.group(1))
+    except Exception as e:
+        print(f'Warning: could not parse allSessions JSON ({e})')
+        return []
+
+    now = datetime.now(timezone.utc)
+    results = []
+
+    for session in data:
+        # Only English sessions
+        lang = (session.get('tem_language') or '').lower()
+        if lang and lang != 'english':
+            continue
+
+        title = (session.get('header_title') or '').strip()
+        if not title:
+            continue
+
+        path = session.get('relpermalink') or session.get('id') or ''
+        url  = ENABLEMENT_BASE + path if path else ''
+
+        # Find future available slots
+        future_slots = [
+            s for s in session.get('sessions', [])
+            if s.get('status') == 'available'
+            and datetime.fromisoformat(s['start_time'].replace('Z', '+00:00')) > now
+        ]
+        if not future_slots:
+            continue
+
+        next_dt = min(
+            datetime.fromisoformat(s['start_time'].replace('Z', '+00:00'))
+            for s in future_slots
+        )
+        next_date_str = next_dt.strftime('%b %d, %Y')
+
+        # Normalize topic names (e.g. "apm" → "APM", "slos" → "SLOs")
+        _abbrevs = {'apm': 'APM', 'slos': 'SLOs', 'cnm': 'CNM', 'rum': 'RUM',
+                    'llm observability': 'LLM Observability', 'ci': 'CI'}
+        raw_topics = session.get('tem_topics') or []
+        topics = []
+        for t in raw_topics:
+            tl = t.lower()
+            topics.append(_abbrevs.get(tl, t.capitalize()))
+
+        results.append((next_dt, title, url, next_date_str, topics))
+
+    results.sort(key=lambda x: x[0])
+    print(f'  {len(results)} upcoming English training session(s)')
+    return [(title, url, date_str, topics) for _, title, url, date_str, topics in results]
+
+
 def create_google_doc(docs_service, gmail_service, storage_client, title, features,
                       upcoming_events=(), on_demand_summits=(),
-                      blog_posts=None):
+                      blog_posts=None, training_sessions=None):
     """
     features:           list of (toc_entry, heading, content, img_map, link_map, inline_atts, msg_id, section)
     upcoming_events:    list of (name, label, url)  — added as "Events" section
     on_demand_summits:  list of (name, label, url)  — added as "Summits" section
     blog_posts:         OrderedDict {month_label: [(title, url, date_str), ...]}
+    training_sessions:  list of (title, url, next_date_str, topics)
     """
     if blog_posts is None:
         blog_posts = {}
+    if training_sessions is None:
+        training_sessions = []
     doc    = docs_service.documents().create(body={'title': title}).execute()
     doc_id = doc['documentId']
 
@@ -650,6 +742,15 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
             for post_title, post_url, date_str in posts:
                 add(f'• {post_title}\n',
                     seg_type='blog_post', post_title=post_title, post_url=post_url)
+
+    # ---- Training / Enablement section ----
+    if training_sessions:
+        add('Training / Enablement\n', style='HEADING_1', seg_type='section_header')
+        for t_title, t_url, t_date, t_topics in training_sessions:
+            topic_str = f' [{", ".join(t_topics)}]' if t_topics else ''
+            line = f'• {t_title} — {t_date}{topic_str}\n'
+            add(line, seg_type='training_item',
+                training_title=t_title, training_url=t_url)
 
     full_text = ''.join(s['text'] for s in segments)
 
@@ -881,6 +982,43 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                     'updateTextStyle': {
                         'range': {'startIndex': lnk_s, 'endIndex': lnk_e},
                         'textStyle': {'link': {'url': post_url}},
+                        'fields': 'link',
+                    }
+                })
+
+    # ---- Training / Enablement items: Arial 11pt, title hyperlinked ----
+    for seg in segments:
+        if seg['type'] == 'training_item':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'lineSpacing': 115,
+                        'spaceBelow':  {'magnitude': 6, 'unit': 'PT'},
+                        'spaceAbove':  {'magnitude': 0, 'unit': 'PT'},
+                    },
+                    'fields': 'lineSpacing,spaceBelow,spaceAbove',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 11, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                    },
+                    'fields': 'fontSize,weightedFontFamily',
+                }
+            })
+            t_url = seg.get('training_url')
+            if t_url:
+                t_title = seg['training_title']
+                lnk_s   = seg['start'] + utf16_len('• ')
+                lnk_e   = lnk_s + utf16_len(t_title)
+                requests.append({
+                    'updateTextStyle': {
+                        'range': {'startIndex': lnk_s, 'endIndex': lnk_e},
+                        'textStyle': {'link': {'url': t_url}},
                         'fields': 'link',
                     }
                 })
@@ -1204,12 +1342,16 @@ def main(year=2026, month=2):
     print('Fetching blog posts (last 3 months)...')
     blog_posts = fetch_blog_posts(months_back=3)
 
+    print('Fetching training / enablement sessions...')
+    training_sessions = fetch_training_sessions()
+
     print(f'Creating Google Doc: "{doc_title}"')
     _, doc_url = create_google_doc(
         docs, gmail, storage_client, doc_title, features,
         upcoming_events=upcoming_events,
         on_demand_summits=on_demand_summits,
         blog_posts=blog_posts,
+        training_sessions=training_sessions,
     )
 
     print(f'\nDone! {len(features)} feature(s) documented.')
