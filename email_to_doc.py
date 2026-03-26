@@ -7,7 +7,7 @@ extracts the external release note section (with images), and creates
 a formatted Google Doc with ToC, page breaks, and hyperlinks.
 """
 
-import os, base64, re, calendar, html, struct, io, time, urllib.request, ssl
+import os, base64, re, calendar, html, struct, io, time, urllib.request, urllib.parse, ssl, json
 import xml.etree.ElementTree as ET
 from datetime import date as _date
 from email.utils import parsedate as _parsedate
@@ -31,6 +31,29 @@ GCS_BUCKET  = 'javier-feature-announcement-images'  # must be globally unique
 
 CREDENTIALS_PATH = os.path.expanduser('~/Documents/Claude/credentials.json')
 TOKEN_PATH       = os.path.expanduser('~/Documents/Claude/token.json')
+
+DD_RUM_AGGREGATE_URL = 'https://api.datadoghq.com/api/v2/rum/analytics/aggregate'
+
+def _load_dd_credentials():
+    """Load DD API/App keys from environment variables or the local RTF key file."""
+    api_key = os.environ.get('DD_API_KEY', '')
+    app_key = os.environ.get('DD_APP_KEY', '')
+    if api_key and app_key:
+        return api_key, app_key
+    # Fall back to reading from the RTF key file
+    key_file = os.path.expanduser('~/Documents/Claude/org2_api_key.txt.rtf')
+    try:
+        with open(key_file, 'r') as f:
+            text = f.read()
+        api_m = re.search(r'Api key:\s*([a-f0-9]{32})', text)
+        app_m = re.search(r'App key:\s*(ddapp_\S+)', text)
+        if api_m: api_key = api_m.group(1)
+        if app_m: app_key = app_m.group(1).rstrip('}')
+    except Exception:
+        pass
+    return api_key, app_key
+
+DD_API_KEY, DD_APP_KEY = _load_dd_credentials()
 
 
 def utf16_len(s):
@@ -655,15 +678,206 @@ def fetch_training_sessions():
     return [(title, url, date_str, topics) for _, title, url, date_str, topics in results]
 
 
+# ---------------------------------------------------------------------------
+# Datadog RUM — customer org usage
+# ---------------------------------------------------------------------------
+
+def _dd_rum_aggregate(payload):
+    """POST to the Datadog RUM aggregate endpoint; returns parsed JSON or None."""
+    body = json.dumps(payload).encode()
+    req  = urllib.request.Request(
+        DD_RUM_AGGREGATE_URL,
+        data=body,
+        headers={
+            'DD-API-KEY':         DD_API_KEY,
+            'DD-APPLICATION-KEY': DD_APP_KEY,
+            'Content-Type':       'application/json',
+        },
+        method='POST',
+    )
+    ctx                = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            return json.load(resp)
+    except Exception as e:
+        print(f'  Warning: DD RUM query failed ({e})')
+        return None
+
+
+def fetch_org_usage(org_id, year, month):
+    """
+    Query Datadog RUM + Metrics for a customer org's platform usage for the given month.
+    Returns a dict mirroring the widgets in platform.rtf.
+    """
+    import datetime as _dt
+
+    ny, nm    = (year + 1, 1) if month == 12 else (year, month + 1)
+    pm        = month - 1 if month > 1 else 12
+    py        = year if month > 1 else year - 1
+    from_ts   = f'{year}-{month:02d}-01T00:00:00+00:00'
+    to_ts     = f'{ny}-{nm:02d}-01T00:00:00+00:00'
+    prev_from = f'{py}-{pm:02d}-01T00:00:00+00:00'
+    prev_to   = from_ts
+
+    q_session = f'@type:session @usr.org_id:{org_id}'
+    q_action  = f'@type:action @usr.org_id:{org_id}'
+    q_view    = f'@type:view @usr.org_id:{org_id}'
+
+    sort_count = {'order': 'desc', 'type': 'measure', 'aggregation': 'count'}
+    sort_sum   = lambda m: {'order': 'desc', 'type': 'measure', 'aggregation': 'sum', 'metric': m}
+    sort_avg   = lambda m: {'order': 'desc', 'type': 'measure', 'aggregation': 'avg', 'metric': m}
+    c_count    = [{'aggregation': 'count', 'metric': '@view.time_spent', 'type': 'total'}]
+    c_sum_sess = [{'aggregation': 'sum', 'metric': '@session.time_spent', 'type': 'total'}]
+    c_sum_view = [{'aggregation': 'sum', 'metric': '@view.time_spent', 'type': 'total'}]
+    c_avg_view = [{'aggregation': 'avg', 'metric': '@view.time_spent', 'type': 'total'}]
+    c_card     = [{'aggregation': 'cardinality', 'metric': '@usr.name', 'type': 'total'}]
+
+    def grp(facet, limit, sort):
+        return [{'facet': facet, 'limit': limit, 'sort': sort}]
+
+    print(f'  Fetching RUM usage for org {org_id} ({year}-{month:02d})...')
+
+    def _q(compute, query, group_by=None, from_=None, to_=None):
+        p = {'compute': compute, 'filter': {'from': from_ or from_ts, 'to': to_ or to_ts, 'query': query}}
+        if group_by:
+            p['group_by'] = group_by
+        return _dd_rum_aggregate(p)
+
+    def buckets(r):
+        return r['data']['buckets'] if r else []
+
+    # Scalar stats
+    r = _q(c_card, q_session)
+    active_users = buckets(r)[0]['computes']['c0'] if buckets(r) else None
+
+    r = _q(c_sum_sess, q_session)
+    total_hours = round(buckets(r)[0]['computes']['c0'] / 1e9 / 3600, 1) if buckets(r) else None
+
+    avg_hours = round(total_hours / active_users, 1) if (total_hours and active_users) else None
+
+    # Most Interacted Products
+    top_products = [
+        (b['by'].get('@view.name', '?'), int(b['computes']['c0']))
+        for b in buckets(_q(c_count, q_action, grp('@view.name', 10, sort_count)))
+    ]
+
+    # Most Active Users by Actions
+    top_users_by_actions = [
+        (b['by'].get('@usr.name', '?'), int(b['computes']['c0']))
+        for b in buckets(_q(c_count, q_action, grp('@usr.name', 10, sort_count)))
+    ]
+
+    # Most Active Users by Time
+    top_users_by_time = [
+        (b['by'].get('@usr.name', '?'), round(b['computes']['c0'] / 1e9 / 3600, 1))
+        for b in buckets(_q(c_sum_sess, q_session, grp('@usr.name', 10, sort_sum('@session.time_spent'))))
+    ]
+
+    # Time Spent in OTB Dashboards
+    otb_q = (f'@type:view @view.name:("/screen/integration/:screenId(/:screenName)" '
+             f'OR "/dash/integration/:screenId(/:screenName)") '
+             f'-@context.browser_test:true @usr.org_id:{org_id}')
+    otb_dashboards = [
+        (b['by'].get('@context.dashboard.title', '?'), round(b['computes']['c0'] / 1e9 / 3600, 1))
+        for b in buckets(_q(c_sum_view, otb_q, grp('@context.dashboard.title', 15, sort_sum('@view.time_spent'))))
+    ]
+
+    # Top AVG Time in Product
+    top_avg_time = [
+        (b['by'].get('@view.name', '?'), round(b['computes']['c0'] / 1e9 / 60, 1))
+        for b in buckets(_q(c_avg_view, q_view, grp('@view.name', 10, sort_avg('@view.time_spent'))))
+    ]
+
+    # Non-Default Dashboards
+    non_default_dashboards = [
+        (b['by'].get('@context.dashboard.title', '?'), int(b['computes']['c0']))
+        for b in buckets(_q(c_count, q_action, grp('@context.dashboard.title', 10, sort_count)))
+        if b['by'].get('@context.dashboard.title', '')
+    ]
+
+    # Heavy Log Searchers
+    log_q = f'@type:action @view.name:"/logs" @action.name:"Send Query" @usr.org_id:{org_id}'
+    heavy_log_searchers = [
+        (b['by'].get('@usr.name', '?'), int(b['computes']['c0']))
+        for b in buckets(_q(c_count, log_q, grp('@usr.name', 10, sort_count)))
+    ]
+
+    # APM Users (current vs prev month)
+    apm_q   = f'@type:action @view.name:/apm* @usr.org_id:{org_id}'
+    cur_apm = {b['by'].get('@usr.name', '?'): int(b['computes']['c0'])
+               for b in buckets(_q(c_count, apm_q, grp('@usr.name', 10, sort_count)))}
+    prev_apm= {b['by'].get('@usr.name', '?'): int(b['computes']['c0'])
+               for b in buckets(_q(c_count, apm_q, grp('@usr.name', 10, sort_count),
+                                  from_=prev_from, to_=prev_to))}
+    apm_users = sorted(
+        [(name, cnt, cnt - prev_apm.get(name, 0)) for name, cnt in cur_apm.items()],
+        key=lambda x: -x[1]
+    )
+
+    # Users per country
+    users_by_country = [
+        (b['by'].get('@geo.country_iso_code', '?'), int(b['computes']['c0']))
+        for b in buckets(_q(c_card, q_session, grp('@geo.country_iso_code', 25, sort_count)))
+    ]
+
+    # Agent versions (Metrics API)
+    agent_versions = []
+    try:
+        now_ts  = int(_dt.datetime.now().timestamp())
+        day_ago = now_ts - 86400
+        mq      = f'sum:dd.agent_stats.agent_version{{datacenter:us1.prod.dog,org_id:{org_id}}} by {{version}}'
+        murl    = (f'https://api.datadoghq.com/api/v1/query'
+                   f'?from={day_ago}&to={now_ts}&query={urllib.parse.quote(mq)}')
+        mreq    = urllib.request.Request(murl, headers={
+            'DD-API-KEY': DD_API_KEY, 'DD-APPLICATION-KEY': DD_APP_KEY})
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        with urllib.request.urlopen(mreq, timeout=30, context=ctx) as resp:
+            mr = json.load(resp)
+        for s in mr.get('series', []):
+            ver = next((t.split(':')[1] for t in s.get('tag_set', []) if t.startswith('version:')), '?')
+            pts = [p[1] for p in s.get('pointlist', []) if p[1] is not None]
+            val = int(max(pts)) if pts else 0
+            if val > 0:
+                agent_versions.append((ver, val))
+        agent_versions.sort(key=lambda x: -x[1])
+    except Exception as e:
+        print(f'  Warning: agent metrics failed ({e})')
+
+    print(f'  -> {active_users} users, {total_hours}h total, {len(top_products)} products, '
+          f'{len(users_by_country)} countries, {len(agent_versions)} agent versions')
+
+    return {
+        'org_id':               org_id,
+        'active_users':         active_users,
+        'total_hours':          total_hours,
+        'avg_hours_per_user':   avg_hours,
+        'top_products':         top_products,
+        'top_users_by_actions': top_users_by_actions,
+        'top_users_by_time':    top_users_by_time,
+        'otb_dashboards':       otb_dashboards,
+        'top_avg_time':         top_avg_time,
+        'non_default_dashboards': non_default_dashboards,
+        'heavy_log_searchers':  heavy_log_searchers,
+        'apm_users':            apm_users,
+        'users_by_country':     users_by_country,
+        'agent_versions':       agent_versions,
+    }
+
+
 def create_google_doc(docs_service, gmail_service, storage_client, title, features,
                       upcoming_events=(), on_demand_summits=(),
-                      blog_posts=None, training_sessions=None):
+                      blog_posts=None, training_sessions=None, org_usage=None):
     """
     features:           list of (toc_entry, heading, content, img_map, link_map, inline_atts, msg_id, section)
     upcoming_events:    list of (name, label, url)  — added as "Events" section
     on_demand_summits:  list of (name, label, url)  — added as "Summits" section
     blog_posts:         OrderedDict {month_label: [(title, url, date_str), ...]}
     training_sessions:  list of (title, url, next_date_str, topics)
+    org_usage:          dict from fetch_org_usage() — added as "Customer Platform Usage" section
     """
     if blog_posts is None:
         blog_posts = {}
@@ -707,10 +921,22 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
     add('Table of Contents\n', style='HEADING_1', seg_type='toc_header')
     add('\n')
     for sname, idxs in sections.items():
-        add(f'{sname}\n', seg_type='toc_section_label')
+        add(f'{sname} ({len(idxs)} features)\n', seg_type='toc_section_label')
         for i in idxs:
             add(f'• {features[i][0]}\n', seg_type='toc_entry', feature_idx=i)
         add('\n')
+    # Links to non-feature sections
+    other_sections = []
+    if upcoming_events:   other_sections.append(('Events', 'Events'))
+    if on_demand_summits: other_sections.append(('Summits', 'Summits'))
+    if blog_posts:        other_sections.append(('Blog Posts', 'Blog Posts'))
+    if training_sessions: other_sections.append(('Training / Enablement', 'Training / Enablement'))
+    if org_usage:         other_sections.append(('Customer Platform Usage',
+                              f'Customer Platform Usage — Org {org_usage["org_id"]}'))
+    if other_sections:
+        add('Additional Sections\n', seg_type='toc_section_label')
+        for label, heading in other_sections:
+            add(f'• {label}\n', seg_type='toc_other_entry', target_heading=heading)
     add('\n')
 
     # ---- Content sections (GA / Preview features) ----
@@ -751,6 +977,81 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
             line = f'• {t_title} — {t_date}{topic_str}\n'
             add(line, seg_type='training_item',
                 training_title=t_title, training_url=t_url)
+
+    # ---- Customer Platform Usage section ----
+    if org_usage:
+        ou  = org_usage
+        TOP = 5
+        add(f'Customer Platform Usage — Org {ou["org_id"]}\n', style='HEADING_1', seg_type='section_header')
+
+        # One-line summary
+        stats = []
+        if ou.get('active_users')       is not None: stats.append(f'{ou["active_users"]} active users')
+        if ou.get('total_hours')        is not None: stats.append(f'{ou["total_hours"]}h total time')
+        if ou.get('avg_hours_per_user') is not None: stats.append(f'{ou["avg_hours_per_user"]}h avg/user')
+        if ou.get('users_by_country'):               stats.append(f'{len(ou["users_by_country"])} countries')
+        if stats:
+            add('  ·  '.join(stats) + '\n\n', seg_type='usage_stats')
+
+        # Most Active Users — actions + time combined
+        actions_map = dict(ou.get('top_users_by_actions', []))
+        time_map    = dict(ou.get('top_users_by_time', []))
+        all_users   = list(dict.fromkeys(list(actions_map) + list(time_map)))[:TOP]
+        if all_users:
+            add('Most Active Users\n', seg_type='usage_subheader')
+            for name in all_users:
+                parts = []
+                if name in actions_map: parts.append(f'{actions_map[name]:,} actions')
+                if name in time_map:    parts.append(f'{time_map[name]}h')
+                add(f'• {name} — {" · ".join(parts)}\n', seg_type='usage_item')
+            add('\n')
+
+        # Top Products
+        if ou.get('top_products'):
+            add('Most Interacted Products\n', seg_type='usage_subheader')
+            for name, count in ou['top_products'][:TOP]:
+                add(f'• {name} — {count:,} actions\n', seg_type='usage_item')
+            add('\n')
+
+        # Dashboards: OTB + custom combined
+        if ou.get('otb_dashboards') or ou.get('non_default_dashboards'):
+            add('Dashboards\n', seg_type='usage_subheader')
+            if ou.get('otb_dashboards'):
+                add('Out-of-the-Box (by time spent)\n', seg_type='usage_item_label')
+                for name, hrs in ou['otb_dashboards'][:TOP]:
+                    add(f'    • {name} — {hrs}h\n', seg_type='usage_item')
+            if ou.get('non_default_dashboards'):
+                add('Custom (by actions)\n', seg_type='usage_item_label')
+                for name, count in ou['non_default_dashboards'][:TOP]:
+                    add(f'    • {name} — {count:,} actions\n', seg_type='usage_item')
+            add('\n')
+
+        # APM + Logs
+        if ou.get('apm_users') or ou.get('heavy_log_searchers'):
+            add('Product Spotlight\n', seg_type='usage_subheader')
+            if ou.get('apm_users'):
+                add('APM (vs prev month)\n', seg_type='usage_item_label')
+                for name, count, delta in ou['apm_users'][:TOP]:
+                    sign = '+' if delta >= 0 else ''
+                    add(f'    • {name} — {count:,}  ({sign}{delta:,})\n', seg_type='usage_item')
+            if ou.get('heavy_log_searchers'):
+                add('Heavy Log Searchers\n', seg_type='usage_item_label')
+                for name, count in ou['heavy_log_searchers'][:TOP]:
+                    add(f'    • {name} — {count:,} queries\n', seg_type='usage_item')
+            add('\n')
+
+        # Countries as single line
+        if ou.get('users_by_country'):
+            country_str = ',  '.join(f'{c} ({n})' for c, n in ou['users_by_country'])
+            add('Geography\n', seg_type='usage_subheader')
+            add(f'{country_str}\n\n', seg_type='usage_item')
+
+        # Agent versions top 5 as single line
+        if ou.get('agent_versions'):
+            top_vers = ou['agent_versions'][:TOP]
+            ver_str  = ',  '.join(f'{v} ({n:,})' for v, n in top_vers)
+            add('Agent Versions (top 5 by host count)\n', seg_type='usage_subheader')
+            add(f'{ver_str}\n\n', seg_type='usage_item')
 
     full_text = ''.join(s['text'] for s in segments)
 
@@ -822,7 +1123,7 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
 
     # ---- Body text: Arial 11pt, 1.15 line spacing, 8pt paragraph spacing ----
     for seg in segments:
-        if seg['type'] in ('content', 'toc_entry'):
+        if seg['type'] in ('content', 'toc_entry', 'toc_other_entry'):
             requests.append({
                 'updateParagraphStyle': {
                     'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
@@ -1023,6 +1324,96 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                     }
                 })
 
+    # ---- Customer usage stats: bold summary line ----
+    for seg in segments:
+        if seg['type'] == 'usage_stats':
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 12, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'bold':               True,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,bold',
+                }
+            })
+
+    # ---- Customer usage subheaders: Arial 12pt bold ----
+    for seg in segments:
+        if seg['type'] == 'usage_subheader':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'spaceAbove': {'magnitude': 10, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 2,  'unit': 'PT'},
+                    },
+                    'fields': 'spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 12, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'bold':               True,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,bold',
+                }
+            })
+
+    # ---- Customer usage sub-labels: Arial 11pt italic ----
+    for seg in segments:
+        if seg['type'] == 'usage_item_label':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'spaceAbove': {'magnitude': 6, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 0, 'unit': 'PT'},
+                    },
+                    'fields': 'spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 11, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'italic':             True,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,italic',
+                }
+            })
+
+    # ---- Customer usage list items: Arial 11pt ----
+    for seg in segments:
+        if seg['type'] == 'usage_item':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'lineSpacing': 115,
+                        'spaceBelow':  {'magnitude': 3, 'unit': 'PT'},
+                        'spaceAbove':  {'magnitude': 0, 'unit': 'PT'},
+                    },
+                    'fields': 'lineSpacing,spaceBelow,spaceAbove',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 11, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                    },
+                    'fields': 'fontSize,weightedFontFamily',
+                }
+            })
+
     docs_batch_update(docs_service, doc_id, requests)
 
     # ------------------------------------------------------------------
@@ -1057,18 +1448,30 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                         'fields': 'link',
                     }
                 })
+        elif seg['type'] == 'toc_other_entry':
+            hid = heading_ids.get(seg.get('target_heading', ''))
+            if hid:
+                url = f'https://docs.google.com/document/d/{doc_id}/edit#heading={hid}'
+                toc_reqs.append({
+                    'updateTextStyle': {
+                        'range': {
+                            'startIndex': seg['start'] + 2,
+                            'endIndex':   seg['end']   - 1,
+                        },
+                        'textStyle': {'link': {'url': url}},
+                        'fields': 'link',
+                    }
+                })
     if toc_reqs:
         docs_batch_update(docs_service, doc_id, toc_reqs)
 
     # ------------------------------------------------------------------
-    # Pass 3 — insert NEXT_PAGE section breaks before section headers
-    # and each feature heading.
-    # IMPORTANT: must happen before Pass 3.5 (marker deletion) so that
-    # segment positions from Pass 1 are still valid here.
+    # Pass 3 — page breaks between major sections only (not per feature)
+    # IMPORTANT: must happen before Pass 3.5 so segment positions are valid.
     # ------------------------------------------------------------------
     break_reqs = [
         {'insertSectionBreak': {'location': {'index': seg['start']}, 'sectionType': 'NEXT_PAGE'}}
-        for seg in reversed([s for s in segments if s['type'] in ('section_header', 'feature_heading')])
+        for seg in reversed([s for s in segments if s['type'] == 'section_header'])
     ]
     if break_reqs:
         docs_batch_update(docs_service, doc_id, break_reqs)
@@ -1345,6 +1748,9 @@ def main(year=2026, month=2):
     print('Fetching training / enablement sessions...')
     training_sessions = fetch_training_sessions()
 
+    print('Fetching customer platform usage (org 16721)...')
+    org_usage = fetch_org_usage(org_id=16721, year=year, month=month)
+
     print(f'Creating Google Doc: "{doc_title}"')
     _, doc_url = create_google_doc(
         docs, gmail, storage_client, doc_title, features,
@@ -1352,6 +1758,7 @@ def main(year=2026, month=2):
         on_demand_summits=on_demand_summits,
         blog_posts=blog_posts,
         training_sessions=training_sessions,
+        org_usage=org_usage,
     )
 
     print(f'\nDone! {len(features)} feature(s) documented.')
