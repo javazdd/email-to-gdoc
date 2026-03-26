@@ -917,6 +917,16 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
         segments.append(seg)
         pos += tl
 
+    # ---- Newsletter title page ----
+    date_label = title.split(' - ')[-1].strip() if ' - ' in title else title
+    add('\n\n\n\n', seg_type='nl_spacer')
+    add('Datadog\n', seg_type='nl_brand')
+    add('Feature Announcements\n', seg_type='nl_title')
+    add('\n', seg_type='nl_spacer')
+    add(f'{date_label}\n', seg_type='nl_date')
+    add('General Availability & Preview Releases\n', seg_type='nl_tagline')
+    add('\n\n\n\n\n', seg_type='nl_spacer')
+
     # ---- ToC ----
     add('Table of Contents\n', style='HEADING_1', seg_type='toc_header')
     add('\n')
@@ -989,7 +999,6 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
         if ou.get('active_users')       is not None: stats.append(f'{ou["active_users"]} active users')
         if ou.get('total_hours')        is not None: stats.append(f'{ou["total_hours"]}h total time')
         if ou.get('avg_hours_per_user') is not None: stats.append(f'{ou["avg_hours_per_user"]}h avg/user')
-        if ou.get('users_by_country'):               stats.append(f'{len(ou["users_by_country"])} countries')
         if stats:
             add('  ·  '.join(stats) + '\n\n', seg_type='usage_stats')
 
@@ -1040,18 +1049,6 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                     add(f'    • {name} — {count:,} queries\n', seg_type='usage_item')
             add('\n')
 
-        # Countries as single line
-        if ou.get('users_by_country'):
-            country_str = ',  '.join(f'{c} ({n})' for c, n in ou['users_by_country'])
-            add('Geography\n', seg_type='usage_subheader')
-            add(f'{country_str}\n\n', seg_type='usage_item')
-
-        # Agent versions top 5 as single line
-        if ou.get('agent_versions'):
-            top_vers = ou['agent_versions'][:TOP]
-            ver_str  = ',  '.join(f'{v} ({n:,})' for v, n in top_vers)
-            add('Agent Versions (top 5 by host count)\n', seg_type='usage_subheader')
-            add(f'{ver_str}\n\n', seg_type='usage_item')
 
     full_text = ''.join(s['text'] for s in segments)
 
@@ -1414,6 +1411,110 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                 }
             })
 
+    # ---- Newsletter brand (Datadog): centered, Arial 36pt bold ----
+    for seg in segments:
+        if seg['type'] == 'nl_brand':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'alignment':  'CENTER',
+                        'spaceAbove': {'magnitude': 0, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 4, 'unit': 'PT'},
+                    },
+                    'fields': 'alignment,spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 36, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'bold':               True,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,bold',
+                }
+            })
+
+    # ---- Newsletter main title: centered, Arial 26pt ----
+    for seg in segments:
+        if seg['type'] == 'nl_title':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'alignment':  'CENTER',
+                        'spaceAbove': {'magnitude': 0,  'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 18, 'unit': 'PT'},
+                    },
+                    'fields': 'alignment,spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 26, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'bold':               False,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,bold',
+                }
+            })
+
+    # ---- Newsletter date label: centered, Arial 16pt italic ----
+    for seg in segments:
+        if seg['type'] == 'nl_date':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'alignment':  'CENTER',
+                        'spaceAbove': {'magnitude': 0, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 6, 'unit': 'PT'},
+                    },
+                    'fields': 'alignment,spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 16, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'italic':             True,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,italic',
+                }
+            })
+
+    # ---- Newsletter tagline: centered, Arial 12pt italic ----
+    for seg in segments:
+        if seg['type'] == 'nl_tagline':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'alignment':  'CENTER',
+                        'spaceAbove': {'magnitude': 0, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 0, 'unit': 'PT'},
+                    },
+                    'fields': 'alignment,spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 12, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'italic':             True,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,italic',
+                }
+            })
+
     docs_batch_update(docs_service, doc_id, requests)
 
     # ------------------------------------------------------------------
@@ -1467,11 +1568,13 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
 
     # ------------------------------------------------------------------
     # Pass 3 — page breaks between major sections only (not per feature)
+    # Also add a page break before the ToC so the title page stands alone.
     # IMPORTANT: must happen before Pass 3.5 so segment positions are valid.
     # ------------------------------------------------------------------
+    break_targets = [s for s in segments if s['type'] in ('section_header', 'toc_header')]
     break_reqs = [
         {'insertSectionBreak': {'location': {'index': seg['start']}, 'sectionType': 'NEXT_PAGE'}}
-        for seg in reversed([s for s in segments if s['type'] == 'section_header'])
+        for seg in reversed(break_targets)
     ]
     if break_reqs:
         docs_batch_update(docs_service, doc_id, break_reqs)
