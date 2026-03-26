@@ -870,7 +870,8 @@ def fetch_org_usage(org_id, year, month):
 
 def create_google_doc(docs_service, gmail_service, storage_client, title, features,
                       upcoming_events=(), on_demand_summits=(),
-                      blog_posts=None, training_sessions=None, org_usage=None):
+                      blog_posts=None, training_sessions=None, org_usage=None,
+                      customer=''):
     """
     features:           list of (toc_entry, heading, content, img_map, link_map, inline_atts, msg_id, section)
     upcoming_events:    list of (name, label, url)  — added as "Events" section
@@ -918,14 +919,12 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
         pos += tl
 
     # ---- Newsletter title page ----
-    date_label = title.split(' - ')[-1].strip() if ' - ' in title else title
-    add('\n\n\n\n', seg_type='nl_spacer')
-    add('Datadog\n', seg_type='nl_brand')
-    add('Feature Announcements\n', seg_type='nl_title')
-    add('\n', seg_type='nl_spacer')
-    add(f'{date_label}\n', seg_type='nl_date')
-    add('General Availability & Preview Releases\n', seg_type='nl_tagline')
+    date_label    = title.split(' - ')[-1].strip() if ' - ' in title else title
+    customer_line = f'Datadog for {customer} Monthly Newsletter\n' if customer else 'Datadog Monthly Newsletter\n'
     add('\n\n\n\n\n', seg_type='nl_spacer')
+    add(customer_line, seg_type='nl_brand')
+    add(f'{date_label}\n', seg_type='nl_date')
+    add('\n\n\n\n\n\n', seg_type='nl_spacer')
 
     # ---- ToC ----
     add('Table of Contents\n', style='HEADING_1', seg_type='toc_header')
@@ -1405,87 +1404,9 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                 }
             })
 
-    # ---- Newsletter brand (Datadog): centered, Arial 36pt bold ----
+    # ---- Newsletter main title: centered, Arial 28pt bold ----
     for seg in segments:
         if seg['type'] == 'nl_brand':
-            requests.append({
-                'updateParagraphStyle': {
-                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
-                    'paragraphStyle': {
-                        'alignment':  'CENTER',
-                        'spaceAbove': {'magnitude': 0, 'unit': 'PT'},
-                        'spaceBelow': {'magnitude': 4, 'unit': 'PT'},
-                    },
-                    'fields': 'alignment,spaceAbove,spaceBelow',
-                }
-            })
-            requests.append({
-                'updateTextStyle': {
-                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
-                    'textStyle': {
-                        'fontSize':           {'magnitude': 36, 'unit': 'PT'},
-                        'weightedFontFamily': {'fontFamily': 'Arial'},
-                        'bold':               True,
-                    },
-                    'fields': 'fontSize,weightedFontFamily,bold',
-                }
-            })
-
-    # ---- Newsletter main title: centered, Arial 26pt ----
-    for seg in segments:
-        if seg['type'] == 'nl_title':
-            requests.append({
-                'updateParagraphStyle': {
-                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
-                    'paragraphStyle': {
-                        'alignment':  'CENTER',
-                        'spaceAbove': {'magnitude': 0,  'unit': 'PT'},
-                        'spaceBelow': {'magnitude': 18, 'unit': 'PT'},
-                    },
-                    'fields': 'alignment,spaceAbove,spaceBelow',
-                }
-            })
-            requests.append({
-                'updateTextStyle': {
-                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
-                    'textStyle': {
-                        'fontSize':           {'magnitude': 26, 'unit': 'PT'},
-                        'weightedFontFamily': {'fontFamily': 'Arial'},
-                        'bold':               False,
-                    },
-                    'fields': 'fontSize,weightedFontFamily,bold',
-                }
-            })
-
-    # ---- Newsletter date label: centered, Arial 16pt italic ----
-    for seg in segments:
-        if seg['type'] == 'nl_date':
-            requests.append({
-                'updateParagraphStyle': {
-                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
-                    'paragraphStyle': {
-                        'alignment':  'CENTER',
-                        'spaceAbove': {'magnitude': 0, 'unit': 'PT'},
-                        'spaceBelow': {'magnitude': 6, 'unit': 'PT'},
-                    },
-                    'fields': 'alignment,spaceAbove,spaceBelow',
-                }
-            })
-            requests.append({
-                'updateTextStyle': {
-                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
-                    'textStyle': {
-                        'fontSize':           {'magnitude': 16, 'unit': 'PT'},
-                        'weightedFontFamily': {'fontFamily': 'Arial'},
-                        'italic':             True,
-                    },
-                    'fields': 'fontSize,weightedFontFamily,italic',
-                }
-            })
-
-    # ---- Newsletter tagline: centered, Arial 12pt italic ----
-    for seg in segments:
-        if seg['type'] == 'nl_tagline':
             requests.append({
                 'updateParagraphStyle': {
                     'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
@@ -1501,11 +1422,38 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                 'updateTextStyle': {
                     'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
                     'textStyle': {
-                        'fontSize':           {'magnitude': 12, 'unit': 'PT'},
+                        'fontSize':           {'magnitude': 28, 'unit': 'PT'},
                         'weightedFontFamily': {'fontFamily': 'Arial'},
-                        'italic':             True,
+                        'bold':               True,
                     },
-                    'fields': 'fontSize,weightedFontFamily,italic',
+                    'fields': 'fontSize,weightedFontFamily,bold',
+                }
+            })
+
+    # ---- Newsletter date: centered, Arial 18pt ----
+    for seg in segments:
+        if seg['type'] == 'nl_date':
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'alignment':  'CENTER',
+                        'spaceAbove': {'magnitude': 8, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 0, 'unit': 'PT'},
+                    },
+                    'fields': 'alignment,spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 18, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'bold':               False,
+                        'italic':             False,
+                    },
+                    'fields': 'fontSize,weightedFontFamily,bold,italic',
                 }
             })
 
@@ -1708,7 +1656,7 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
 # Main
 # ---------------------------------------------------------------------------
 
-def main(year=2026, month=2):
+def main(year=2026, month=2, customer=''):
     month_name = calendar.month_name[month]
     doc_title  = f'Feature Announcements - {month_name} {year}'
 
@@ -1841,6 +1789,7 @@ def main(year=2026, month=2):
         blog_posts=blog_posts,
         training_sessions=training_sessions,
         org_usage=org_usage,
+        customer=customer,
     )
 
     print(f'\nDone! {len(features)} feature(s) documented.')
@@ -1848,4 +1797,9 @@ def main(year=2026, month=2):
 
 
 if __name__ == '__main__':
-    main(year=2026, month=2)
+    import sys
+    args    = sys.argv[1:]
+    year    = int(args[0]) if len(args) > 0 else 2026
+    month   = int(args[1]) if len(args) > 1 else 2
+    customer = args[2]      if len(args) > 2 else ''
+    main(year=year, month=month, customer=customer)
