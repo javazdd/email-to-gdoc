@@ -930,23 +930,16 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
     # ---- ToC ----
     add('Table of Contents\n', style='HEADING_1', seg_type='toc_header')
     add('\n')
+    # One line per feature section linking to its header
     for sname, idxs in sections.items():
-        add(f'{sname} ({len(idxs)} features)\n', seg_type='toc_section_label')
-        for i in idxs:
-            add(f'• {features[i][0]}\n', seg_type='toc_entry', feature_idx=i)
-        add('\n')
-    # Links to non-feature sections
-    other_sections = []
-    if upcoming_events:   other_sections.append(('Events', 'Events'))
-    if on_demand_summits: other_sections.append(('Summits', 'Summits'))
-    if blog_posts:        other_sections.append(('Blog Posts', 'Blog Posts'))
-    if training_sessions: other_sections.append(('Training / Enablement', 'Training / Enablement'))
-    if org_usage:         other_sections.append(('Customer Platform Usage',
-                              f'Customer Platform Usage — Org {org_usage["org_id"]}'))
-    if other_sections:
-        add('Additional Sections\n', seg_type='toc_section_label')
-        for label, heading in other_sections:
-            add(f'• {label}\n', seg_type='toc_other_entry', target_heading=heading)
+        add(f'{sname} ({len(idxs)} features)\n', seg_type='toc_section_entry', target_heading=sname)
+    # Other sections at same level — no sub-items, no "Additional Sections" header
+    if upcoming_events:   add('Events\n',                  seg_type='toc_section_entry', target_heading='Events')
+    if on_demand_summits: add('Summits\n',                 seg_type='toc_section_entry', target_heading='Summits')
+    if blog_posts:        add('Blog Posts\n',              seg_type='toc_section_entry', target_heading='Blog Posts')
+    if training_sessions: add('Training / Enablement\n',   seg_type='toc_section_entry', target_heading='Training / Enablement')
+    if org_usage:         add('Customer Platform Usage\n', seg_type='toc_section_entry',
+                              target_heading=f'Customer Platform Usage — Org {org_usage["org_id"]}')
     add('\n')
 
     # ---- Content sections (GA / Preview features) ----
@@ -1094,14 +1087,15 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
             })
 
     # ---- ToC section labels: Arial 12pt bold ----
+    # ---- ToC entries: Arial 13pt, each line is a clickable section link ----
     for seg in segments:
-        if seg['type'] == 'toc_section_label':
+        if seg['type'] == 'toc_section_entry':
             requests.append({
                 'updateParagraphStyle': {
                     'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
                     'paragraphStyle': {
-                        'spaceAbove': {'magnitude': 8, 'unit': 'PT'},
-                        'spaceBelow': {'magnitude': 4, 'unit': 'PT'},
+                        'spaceAbove': {'magnitude': 6, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 2, 'unit': 'PT'},
                     },
                     'fields': 'spaceAbove,spaceBelow',
                 }
@@ -1110,9 +1104,9 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                 'updateTextStyle': {
                     'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
                     'textStyle': {
-                        'fontSize':           {'magnitude': 12, 'unit': 'PT'},
+                        'fontSize':           {'magnitude': 13, 'unit': 'PT'},
                         'weightedFontFamily': {'fontFamily': 'Arial'},
-                        'bold':               True,
+                        'bold':               False,
                     },
                     'fields': 'fontSize,weightedFontFamily,bold',
                 }
@@ -1120,7 +1114,7 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
 
     # ---- Body text: Arial 11pt, 1.15 line spacing, 8pt paragraph spacing ----
     for seg in segments:
-        if seg['type'] in ('content', 'toc_entry', 'toc_other_entry'):
+        if seg['type'] == 'content':
             requests.append({
                 'updateParagraphStyle': {
                     'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
@@ -1534,30 +1528,15 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
 
     toc_reqs = []
     for seg in segments:
-        if seg['type'] == 'toc_entry':
-            heading = features[seg['feature_idx']][1]
-            hid     = heading_ids.get(heading)
-            if hid:
-                url = f'https://docs.google.com/document/d/{doc_id}/edit#heading={hid}'
-                toc_reqs.append({
-                    'updateTextStyle': {
-                        'range': {
-                            'startIndex': seg['start'] + 2,   # skip '• '
-                            'endIndex':   seg['end']   - 1,   # skip '\n'
-                        },
-                        'textStyle': {'link': {'url': url}},
-                        'fields': 'link',
-                    }
-                })
-        elif seg['type'] == 'toc_other_entry':
+        if seg['type'] == 'toc_section_entry':
             hid = heading_ids.get(seg.get('target_heading', ''))
             if hid:
                 url = f'https://docs.google.com/document/d/{doc_id}/edit#heading={hid}'
                 toc_reqs.append({
                     'updateTextStyle': {
                         'range': {
-                            'startIndex': seg['start'] + 2,
-                            'endIndex':   seg['end']   - 1,
+                            'startIndex': seg['start'],
+                            'endIndex':   seg['end'] - 1,   # skip '\n'
                         },
                         'textStyle': {'link': {'url': url}},
                         'fields': 'link',
