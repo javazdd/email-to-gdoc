@@ -34,6 +34,16 @@ TOKEN_PATH       = os.path.expanduser('~/Documents/Claude/token.json')
 
 DD_RUM_AGGREGATE_URL = 'https://api.datadoghq.com/api/v2/rum/analytics/aggregate'
 
+# Datadog site → base URL mapping
+SITE_URLS = {
+    'us1': 'https://app.datadoghq.com',
+    'us3': 'https://us3.datadoghq.com',
+    'us5': 'https://us5.datadoghq.com',
+    'eu1': 'https://app.datadoghq.eu',
+    'ap1': 'https://ap1.datadoghq.com',
+    'fed': 'https://app.ddog-gov.com',
+}
+
 def _load_dd_credentials():
     """Load DD API/App keys from environment variables or the local RTF key file."""
     api_key = os.environ.get('DD_API_KEY', '')
@@ -868,12 +878,12 @@ def fetch_org_usage(org_id, year, month):
     }
 
 
-def create_google_doc(docs_service, gmail_service, storage_client, title, features,
+def create_google_doc(docs_service, title, release_notes_url=None,
                       upcoming_events=(), on_demand_summits=(),
                       blog_posts=None, training_sessions=None, org_usage=None,
                       customer=''):
     """
-    features:           list of (toc_entry, heading, content, img_map, link_map, inline_atts, msg_id, section)
+    release_notes_url:  URL to the customer's Datadog release notes page
     upcoming_events:    list of (name, label, url)  — added as "Events" section
     on_demand_summits:  list of (name, label, url)  — added as "Summits" section
     blog_posts:         OrderedDict {month_label: [(title, url, date_str), ...]}
@@ -884,15 +894,9 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
         blog_posts = {}
     if training_sessions is None:
         training_sessions = []
+    from collections import OrderedDict
     doc    = docs_service.documents().create(body={'title': title}).execute()
     doc_id = doc['documentId']
-
-    # Group features by section, preserving insertion order
-    from collections import OrderedDict
-    sections = OrderedDict()
-    for i, feat in enumerate(features):
-        sname = feat[7]
-        sections.setdefault(sname, []).append(i)   # list of global feature indices
 
     # ------------------------------------------------------------------
     # Pass 1 — insert all content text + paragraph/text styles
@@ -929,10 +933,7 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
     # ---- ToC ----
     add('Table of Contents\n', style='HEADING_1', seg_type='toc_header')
     add('\n')
-    # One line per feature section linking to its header
-    for sname, idxs in sections.items():
-        add(f'{sname} ({len(idxs)} features)\n', seg_type='toc_section_entry', target_heading=sname)
-    # Other sections at same level — no sub-items, no "Additional Sections" header
+    if release_notes_url: add("What's New\n",              seg_type='toc_section_entry', target_heading="What's New")
     if upcoming_events:   add('Events\n',                  seg_type='toc_section_entry', target_heading='Events')
     if on_demand_summits: add('Summits\n',                 seg_type='toc_section_entry', target_heading='Summits')
     if blog_posts:        add('Blog Posts\n',              seg_type='toc_section_entry', target_heading='Blog Posts')
@@ -941,12 +942,12 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                               target_heading=f'Customer Platform Usage — Org {org_usage["org_id"]}')
     add('\n')
 
-    # ---- Content sections (GA / Preview features) ----
-    for sname, idxs in sections.items():
-        add(f'{sname}\n', style='HEADING_1', seg_type='section_header')
-        for i in idxs:
-            add(f'{features[i][1]}\n', style='HEADING_2', seg_type='feature_heading', feature_idx=i)
-            add(f'{features[i][2]}\n\n', seg_type='content', feature_idx=i)
+    # ---- What's New section (link to release notes) ----
+    if release_notes_url:
+        add("What's New\n", style='HEADING_1', seg_type='section_header')
+        add('Explore this month\'s latest feature releases and product updates directly in your Datadog account.\n\n',
+            seg_type='content')
+        add('View Release Notes\n', seg_type='release_notes_link', release_notes_url=release_notes_url)
 
     # ---- Events section (upcoming summits) ----
     if upcoming_events:
@@ -1457,6 +1458,33 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
                 }
             })
 
+    # ---- Release notes link: Arial 13pt bold, hyperlinked ----
+    for seg in segments:
+        if seg['type'] == 'release_notes_link':
+            url = seg.get('release_notes_url', '')
+            requests.append({
+                'updateParagraphStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end']},
+                    'paragraphStyle': {
+                        'spaceAbove': {'magnitude': 8, 'unit': 'PT'},
+                        'spaceBelow': {'magnitude': 0, 'unit': 'PT'},
+                    },
+                    'fields': 'spaceAbove,spaceBelow',
+                }
+            })
+            requests.append({
+                'updateTextStyle': {
+                    'range': {'startIndex': seg['start'], 'endIndex': seg['end'] - 1},
+                    'textStyle': {
+                        'fontSize':           {'magnitude': 13, 'unit': 'PT'},
+                        'weightedFontFamily': {'fontFamily': 'Arial'},
+                        'bold':               True,
+                        'link':               {'url': url},
+                    },
+                    'fields': 'fontSize,weightedFontFamily,bold,link',
+                }
+            })
+
     docs_batch_update(docs_service, doc_id, requests)
 
     # ------------------------------------------------------------------
@@ -1506,147 +1534,6 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
     if break_reqs:
         docs_batch_update(docs_service, doc_id, break_reqs)
 
-    # ------------------------------------------------------------------
-    # Pass 3.5 — apply hyperlinks from LNKS{n}Z / LNKE{n}Z markers,
-    # then delete the markers. Runs after Pass 3 so it uses a fresh
-    # doc.get() and is unaffected by the section break position shifts.
-    # ------------------------------------------------------------------
-    global_link_map = {}
-    for feat in features:
-        for n, url in feat[4].items():
-            global_link_map[n] = url
-
-    if global_link_map:
-        doc_for_links = docs_service.documents().get(documentId=doc_id).execute()
-        link_markers  = find_link_markers_in_doc(doc_for_links)
-
-        # Apply hyperlink styles first (no position shifts yet)
-        link_style_reqs = []
-        for n, positions in link_markers.items():
-            if 'start_marker' not in positions or 'end_marker' not in positions:
-                continue
-            url = global_link_map.get(n)
-            if not url:
-                continue
-            sm_s, sm_e = positions['start_marker']
-            em_s, _    = positions['end_marker']
-            if sm_e < em_s:
-                link_style_reqs.append({
-                    'updateTextStyle': {
-                        'range': {'startIndex': sm_e, 'endIndex': em_s},
-                        'textStyle': {'link': {'url': url}},
-                        'fields': 'link',
-                    }
-                })
-        if link_style_reqs:
-            docs_batch_update(docs_service, doc_id, link_style_reqs)
-
-        # Delete all markers in one batched call (reverse order = safe)
-        all_marker_ranges = []
-        for positions in link_markers.values():
-            if 'start_marker' in positions:
-                all_marker_ranges.append(positions['start_marker'])
-            if 'end_marker' in positions:
-                all_marker_ranges.append(positions['end_marker'])
-        all_marker_ranges.sort(key=lambda x: x[0], reverse=True)
-        if all_marker_ranges:
-            del_reqs = [{'deleteContentRange': {'range': {'startIndex': ms, 'endIndex': me}}}
-                        for ms, me in all_marker_ranges]
-            docs_batch_update(docs_service, doc_id, del_reqs)
-
-    # ------------------------------------------------------------------
-    # Pass 4 — insert inline images
-    # Find IMG_PLACEHOLDER_N in the doc, replace with actual images
-    # ------------------------------------------------------------------
-    # Build a map from placeholder name → image info
-    ph_to_info = {}
-    for feat in features:
-        _, _, _, img_map, _, inline_atts, msg_id, _ = feat
-        for ph, cid in img_map.items():
-            if cid in inline_atts:
-                ph_to_info[ph] = {
-                    'att_info': inline_atts[cid],
-                    'msg_id':   msg_id,
-                }
-
-    if ph_to_info:
-        doc_for_imgs = docs_service.documents().get(documentId=doc_id).execute()
-        ph_positions = find_placeholders_in_doc(doc_for_imgs)
-
-        # Sort by position descending so earlier indices are unaffected
-        ordered = sorted(
-            [(ph, pos) for ph, pos in ph_positions.items() if ph in ph_to_info],
-            key=lambda x: x[1][0],
-            reverse=True
-        )
-
-        for ph, (ph_start, ph_end) in ordered:
-            info      = ph_to_info[ph]
-            att_info  = info['att_info']
-            msg_id    = info['msg_id']
-            mime_type = att_info['mime_type']
-            filename  = att_info['filename']
-
-            print(f'  Downloading: {filename}')
-            img_bytes = download_image(gmail_service, msg_id, att_info)
-            if not img_bytes:
-                print(f'  -> Could not download {filename}, skipping')
-                continue
-
-            print(f'  Uploading to GCS: {filename}')
-            try:
-                img_url = upload_image_to_gcs(storage_client, img_bytes, filename, mime_type)
-                print(f'  -> Public URL: {img_url}')
-            except Exception as e:
-                print(f'  -> GCS upload failed ({e}), skipping image')
-                docs_batch_update(docs_service, doc_id, [{'replaceAllText': {
-                    'containsText': {'text': ph, 'matchCase': True},
-                    'replaceText':  f'[Image: {filename}]',
-                }}])
-                continue
-
-            w_pt, h_pt = image_size_pt(img_bytes, mime_type)
-            try:
-                # Phase 1: insert image BEFORE the placeholder + center its paragraph
-                docs_batch_update(docs_service, doc_id, [
-                    {
-                        'insertInlineImage': {
-                            'location':   {'index': ph_start},
-                            'uri':        img_url,
-                            'objectSize': {
-                                'height': {'magnitude': h_pt, 'unit': 'PT'},
-                                'width':  {'magnitude': w_pt, 'unit': 'PT'},
-                            }
-                        }
-                    },
-                    {
-                        'updateParagraphStyle': {
-                            'range': {
-                                'startIndex': ph_start,
-                                'endIndex':   ph_start + 1,
-                            },
-                            'paragraphStyle': {
-                                'alignment':  'CENTER',
-                                'spaceAbove': {'magnitude': 12, 'unit': 'PT'},
-                                'spaceBelow': {'magnitude': 12, 'unit': 'PT'},
-                            },
-                            'fields': 'alignment,spaceAbove,spaceBelow',
-                        }
-                    },
-                ])
-                # Phase 2: delete the placeholder (now shifted right by 1)
-                docs_batch_update(docs_service, doc_id, [{
-                    'deleteContentRange': {
-                        'range': {'startIndex': ph_start + 1, 'endIndex': ph_end + 1}
-                    }
-                }])
-                print(f'  -> Inserted {w_pt:.0f}×{h_pt:.0f}pt')
-            except Exception as e:
-                print(f'  -> Image insert failed ({e}), replacing with text')
-                docs_batch_update(docs_service, doc_id, [{'replaceAllText': {
-                    'containsText': {'text': ph, 'matchCase': True},
-                    'replaceText':  f'[Image: {filename}]',
-                }}])
 
     doc_url = f'https://docs.google.com/document/d/{doc_id}/edit'
     return doc_id, doc_url
@@ -1656,117 +1543,21 @@ def create_google_doc(docs_service, gmail_service, storage_client, title, featur
 # Main
 # ---------------------------------------------------------------------------
 
-def main(year=2026, month=2, customer=''):
+def main(year=2026, month=2, customer='', site='us1'):
     month_name = calendar.month_name[month]
-    doc_title  = f'Feature Announcements - {month_name} {year}'
+    doc_title  = f'Datadog Monthly Newsletter - {month_name} {year}'
+
+    base_url         = SITE_URLS.get(site.lower(), SITE_URLS['us1'])
+    release_notes_url = f'{base_url}/release-notes'
 
     print('Authenticating...')
     creds = get_credentials()
 
-    gmail          = build('gmail', 'v1', credentials=creds)
-    docs           = build('docs',  'v1', credentials=creds)
-    storage_client = gcs_lib.Client(project=GCS_PROJECT, credentials=creds)
+    docs = build('docs', 'v1', credentials=creds)
 
-    profile    = gmail.users().getProfile(userId='me').execute()
+    profile    = build('gmail', 'v1', credentials=creds).users().getProfile(userId='me').execute()
     user_email = profile.get('emailAddress', '')
     print(f'Authenticated as: {user_email}\n')
-
-    first_day = f'{year}/{month:02d}/01'
-    ny, nm    = (year + 1, 1) if month == 12 else (year, month + 1)
-    last_day  = f'{ny}/{nm:02d}/01'
-
-    # Search for GA and Preview emails separately, then combine
-    searches = [
-        ('[GA]',      'General Availability'),
-        ('[Preview]', 'Preview'),
-    ]
-
-    features        = []
-    global_img_ctr  = 0
-    global_link_ctr = 0
-
-    for tag, section_name in searches:
-        query = (
-            f'subject:"[Feature Announcement]" subject:"{tag}" '
-            f'after:{first_day} before:{last_day}'
-        )
-        print(f'Searching Gmail ({section_name}): {query}')
-        results  = gmail.users().messages().list(userId='me', q=query, maxResults=100).execute()
-        messages = results.get('messages', [])
-        print(f'Found {len(messages)} matching email(s)\n')
-
-        for msg_ref in messages:
-            msg = gmail.users().messages().get(
-                userId='me', id=msg_ref['id'], format='full'
-            ).execute()
-
-            headers = msg.get('payload', {}).get('headers', [])
-            subject = next(
-                (h['value'] for h in headers if h['name'].lower() == 'subject'), ''
-            )
-            print(f'Processing: {subject}')
-
-            if '[Feature Announcement]' not in subject or tag not in subject:
-                print('  -> Missing required tags, skipping\n')
-                continue
-
-            body, img_map, link_map, inline_atts = get_email_body_and_images(msg)
-
-            # Re-number image placeholders globally to avoid collisions across emails
-            # Re-number image placeholders globally.
-            # Use regex with (?!\d) to avoid IMG_PLACEHOLDER_1 matching inside
-            # IMG_PLACEHOLDER_10, IMG_PLACEHOLDER_11, etc.
-            new_img_map = {}
-            img_n_mapping = {}
-            for old_ph, cid in img_map.items():
-                old_n = int(old_ph.split('_')[-1])
-                new_ph = f'IMG_PLACEHOLDER_{global_img_ctr}'
-                img_n_mapping[old_n] = global_img_ctr
-                global_img_ctr += 1
-                new_img_map[new_ph] = cid
-            if img_n_mapping:
-                def _remap_img(m):
-                    n = int(m.group(1))
-                    return f'IMG_PLACEHOLDER_{img_n_mapping[n]}' if n in img_n_mapping else m.group(0)
-                body = re.sub(r'IMG_PLACEHOLDER_(\d+)', _remap_img, body)
-
-            # Re-number link markers globally in a single regex pass to avoid
-            # collisions from iterative str.replace (e.g. LNKS3Z→LNKS0Z then
-            # LNKS0Z→LNKS3Z reverting the first replacement).
-            new_link_map = {}
-            link_n_mapping = {}
-            for old_n in sorted(link_map.keys()):
-                new_n = global_link_ctr
-                global_link_ctr += 1
-                link_n_mapping[old_n] = new_n
-                new_link_map[new_n] = link_map[old_n]
-            if link_n_mapping:
-                def _remap_link(m):
-                    n = int(m.group(2))
-                    new_n = link_n_mapping.get(n)
-                    if new_n is None:
-                        return m.group(0)
-                    return f'LNKS{new_n}Z' if m.group(1) == 'S' else f'LNKE{new_n}Z'
-                body = re.sub(r'LNK([SE])(\d+)Z', _remap_link, body)
-
-            release_note = extract_release_note(body)
-            if not release_note:
-                print('  -> No external release note section found, skipping\n')
-                continue
-
-            toc_entry, feature_heading = parse_subject(subject)
-            cleaned   = clean_content(release_note, feature_heading)
-            img_count = sum(1 for ph in new_img_map if ph in cleaned)
-            print(f'  -> {len(cleaned)} chars, {img_count} image(s) [{section_name}]\n')
-
-            features.append((
-                toc_entry, feature_heading, cleaned,
-                new_img_map, new_link_map, inline_atts, msg_ref['id'], section_name
-            ))
-
-    if not features:
-        print('No qualifying features found. No document created.')
-        return
 
     print('Fetching events and summits from events.datadoghq.com...')
     upcoming_events, on_demand_summits = fetch_summits()
@@ -1783,7 +1574,8 @@ def main(year=2026, month=2, customer=''):
 
     print(f'Creating Google Doc: "{doc_title}"')
     _, doc_url = create_google_doc(
-        docs, gmail, storage_client, doc_title, features,
+        docs, doc_title,
+        release_notes_url=release_notes_url,
         upcoming_events=upcoming_events,
         on_demand_summits=on_demand_summits,
         blog_posts=blog_posts,
@@ -1792,14 +1584,15 @@ def main(year=2026, month=2, customer=''):
         customer=customer,
     )
 
-    print(f'\nDone! {len(features)} feature(s) documented.')
+    print(f'\nDone!')
     print(f'Open your doc:\n  {doc_url}')
 
 
 if __name__ == '__main__':
     import sys
-    args    = sys.argv[1:]
-    year    = int(args[0]) if len(args) > 0 else 2026
-    month   = int(args[1]) if len(args) > 1 else 2
+    args     = sys.argv[1:]
+    year     = int(args[0]) if len(args) > 0 else 2026
+    month    = int(args[1]) if len(args) > 1 else 2
     customer = args[2]      if len(args) > 2 else ''
-    main(year=year, month=month, customer=customer)
+    site     = args[3]      if len(args) > 3 else 'us1'
+    main(year=year, month=month, customer=customer, site=site)
